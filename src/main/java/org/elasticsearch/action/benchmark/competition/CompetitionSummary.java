@@ -351,6 +351,8 @@ public class CompetitionSummary implements ToXContent {
         sumTotalHits = 0;
         totalRequestedIterations = 0;
         totalCompletedIterations = 0;
+        slowest.clear();
+        percentileValues.clear();
     }
 
     static final class Fields {
