@@ -26,7 +26,6 @@ import org.elasticsearch.action.benchmark.resume.*;
 import org.elasticsearch.action.benchmark.start.*;
 import org.elasticsearch.action.benchmark.status.*;
 import org.elasticsearch.action.search.SearchRequest;
-import org.elasticsearch.common.collect.Tuple;
 import org.elasticsearch.common.settings.ImmutableSettings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.index.query.FilterBuilders;
@@ -39,6 +38,7 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.util.*;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.CyclicBarrier;
 
 import static org.elasticsearch.action.benchmark.BenchmarkTestUtil.*;
@@ -79,7 +79,6 @@ public class BenchmarkIntegrationTest extends AbstractBenchmarkTest {
     public void post() throws Exception {
         final BenchmarkStatusResponses responses = client().prepareBenchmarkStatus().execute().actionGet();
         assertThat("Some benchmarks are still running", responses.responses(), is(empty()));
-
     }
 
     @Test
@@ -117,18 +116,15 @@ public class BenchmarkIntegrationTest extends AbstractBenchmarkTest {
         logger.info("--> Submitting benchmark - competitors [{}] iterations [{}] executors [{}]",
                 request.competitors().size(), request.settings().iterations(), numExecutorNodes);
 
-        // Choose a place to suspend execution
-        final int competitorToPause      = randomIntBetween(0, request.competitors().size() - 1);
-        final int iterationToPauseBefore = randomIntBetween(0, request.competitors().get(competitorToPause).settings().iterations() - 1);
+        // Setup initialization and iteration barriers
+        final List<Semaphore> semaphores = new ArrayList<>(request.numExecutorNodes());
+        final CyclicBarrier barrier = new CyclicBarrier(request.numExecutorNodes() + 1);
+        control(barrier, request.competitors().get(0).name(), semaphores);
 
-        final Tuple<CyclicBarrier, List<MockBenchmarkExecutor.FlowControl>> tuple =
-                                            setUpFlowControl(request, competitorToPause, iterationToPauseBefore);
-
-        // Start benchmark
+        // Start benchmark and block pending initialization
         final ActionFuture<BenchmarkStartResponse> future = client().startBenchmark(request);
-
-        // Wait for all executors to initialize
-        tuple.v1().await();
+        int n = barrier.await();
+        logger.info("--> Passed initialization barrier [{}] on node: [{}] (test thread)", n, clusterService().localNode().name());
 
         // Check status
         validateStatusRunning(BENCHMARK_NAME);
@@ -145,9 +141,11 @@ public class BenchmarkIntegrationTest extends AbstractBenchmarkTest {
         assertThat(statusResponse2.state(), equalTo(BenchmarkStartResponse.State.PAUSED));
         assertFalse(statusResponse2.hasErrors());
 
-        // Release flow control and let the benchmark complete
-        for (MockBenchmarkExecutor.FlowControl control : tuple.v2()) {
-            control.release();
+        // Release iteration semaphores and let executors finish
+        for (BenchmarkExecutorService mock : mockExecutorServices()) {
+            final MockBenchmarkExecutorService.MockBenchmarkExecutor executor = ((MockBenchmarkExecutorService) mock).executor();
+            executor.control.controlSemaphore.release();
+            logger.info("--> Released iteration semaphore: [{}] [{}] (test thread)", executor.control.controlSemaphore, clusterService().localNode().name());
         }
 
         // Resume benchmark
@@ -155,6 +153,7 @@ public class BenchmarkIntegrationTest extends AbstractBenchmarkTest {
         validateStatusResumed(BENCHMARK_NAME, resumeResponse);
 
         // Validate results
+        logger.info("--> Waiting for benchmark to complete");
         final BenchmarkStartResponse startResponse = future.get();
         assertNotNull(startResponse);
         assertThat(startResponse.benchmarkId(), equalTo(BENCHMARK_NAME));
@@ -181,18 +180,15 @@ public class BenchmarkIntegrationTest extends AbstractBenchmarkTest {
         logger.info("--> Submitting benchmark - competitors [{}] iterations [{}] executors [{}]",
                 request.competitors().size(), request.settings().iterations(), numExecutorNodes);
 
-        // Figure out where to suspend execution
-        final int competitorToPause      = randomIntBetween(0, request.competitors().size() - 1);
-        final int iterationToPauseBefore = randomIntBetween(0, request.competitors().get(competitorToPause).settings().iterations() - 1);
-
-        final Tuple<CyclicBarrier, List<MockBenchmarkExecutor.FlowControl>> tuple =
-                setUpFlowControl(request, competitorToPause, iterationToPauseBefore);
+        // Setup initialization and iteration barriers
+        final List<Semaphore> semaphores = new ArrayList<>(request.numExecutorNodes());
+        final CyclicBarrier barrier = new CyclicBarrier(request.numExecutorNodes() + 1);
+        control(barrier, request.competitors().get(0).name(), semaphores);
 
         // Start benchmark
         final ActionFuture<BenchmarkStartResponse> future = client().startBenchmark(request);
-
-        // Wait for all executors to initialize
-        tuple.v1().await();
+        int n = barrier.await();
+        logger.info("--> Passed initialization barrier [{}] on node: [{}] (test thread)", n, clusterService().localNode().name());
 
         // Check status
         validateStatusRunning(BENCHMARK_NAME);
@@ -221,9 +217,11 @@ public class BenchmarkIntegrationTest extends AbstractBenchmarkTest {
         assertThat(statusResponse3.state(), equalTo(BenchmarkStartResponse.State.RUNNING));
         assertFalse(statusResponse3.hasErrors());
 
-        // Release flow control and let the benchmark complete
-        for (MockBenchmarkExecutor.FlowControl control : tuple.v2()) {
-            control.release();
+        // Release iteration semaphores and let executors finish
+        for (BenchmarkExecutorService mock : mockExecutorServices()) {
+            final MockBenchmarkExecutorService.MockBenchmarkExecutor executor = ((MockBenchmarkExecutorService) mock).executor();
+            executor.control.controlSemaphore.release();
+            logger.info("--> Released iteration semaphore: [{}] [{}] (test thread)", executor.control.controlSemaphore, clusterService().localNode().name());
         }
 
         // Validate results
@@ -253,26 +251,25 @@ public class BenchmarkIntegrationTest extends AbstractBenchmarkTest {
         logger.info("--> Submitting benchmark - competitors [{}] iterations [{}] executors [{}]",
                 request.competitors().size(), request.settings().iterations(), numExecutorNodes);
 
-        // Figure out where to suspend execution
-        final int competitorToPause      = randomIntBetween(0, request.competitors().size() - 1);
-        final int iterationToPauseBefore = randomIntBetween(0, request.competitors().get(competitorToPause).settings().iterations() - 1);
-
-        final Tuple<CyclicBarrier, List<MockBenchmarkExecutor.FlowControl>> tuple =
-                                setUpFlowControl(request, competitorToPause, iterationToPauseBefore);
+        // Setup initialization and iteration barriers
+        final List<Semaphore> semaphores = new ArrayList<>(request.numExecutorNodes());
+        final CyclicBarrier barrier = new CyclicBarrier(request.numExecutorNodes() + 1);
+        control(barrier, request.competitors().get(0).name(), semaphores);
 
         // Start benchmark
         final ActionFuture<BenchmarkStartResponse> future = client().startBenchmark(request);
-
-        // Wait for all executors to initialize
-        tuple.v1().await();
+        int n = barrier.await();
+        logger.info("--> Passed initialization barrier [{}] on node: [{}] (test thread)", n, clusterService().localNode().name());
 
         // Abort benchmark
         final BenchmarkAbortResponse abortResponse = client().prepareAbortBench(BENCHMARK_NAME).execute().actionGet();
         validateStatusAborted(BENCHMARK_NAME, abortResponse);
 
-        // Release flow control and let the benchmark complete
-        for (MockBenchmarkExecutor.FlowControl control : tuple.v2()) {
-            control.release();
+        // Release iteration semaphores and let executors finish
+        for (BenchmarkExecutorService mock : mockExecutorServices()) {
+            final MockBenchmarkExecutorService.MockBenchmarkExecutor executor = ((MockBenchmarkExecutorService) mock).executor();
+            executor.control.controlSemaphore.release();
+            logger.info("--> Released iteration semaphore: [{}] [{}] (test thread)", executor.control.controlSemaphore, clusterService().localNode().name());
         }
 
         // Validate results

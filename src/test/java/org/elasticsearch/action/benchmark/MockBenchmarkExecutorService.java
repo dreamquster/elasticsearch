@@ -19,8 +19,11 @@
 
 package org.elasticsearch.action.benchmark;
 
+import org.elasticsearch.ElasticsearchException;
 import org.elasticsearch.ElasticsearchIllegalStateException;
 import org.elasticsearch.action.benchmark.competition.CompetitionIteration;
+import org.elasticsearch.action.benchmark.start.BenchmarkStartRequest;
+import org.elasticsearch.action.benchmark.status.BenchmarkStatusNodeActionResponse;
 import org.elasticsearch.action.search.SearchRequest;
 import org.elasticsearch.client.Client;
 import org.elasticsearch.cluster.ClusterService;
@@ -42,9 +45,11 @@ import java.util.concurrent.Semaphore;
 public final class MockBenchmarkExecutorService extends BenchmarkExecutorService {
 
     @Inject
-    public MockBenchmarkExecutorService(Settings settings, ClusterService clusterService, ThreadPool threadPool,
-                                        Client client, TransportService transportService) {
-        super(settings, clusterService, threadPool, transportService, new MockBenchmarkExecutor(client, clusterService));
+    public MockBenchmarkExecutorService(Settings settings, ClusterService clusterService, 
+                                        ThreadPool threadPool, Client client, 
+                                        TransportService transportService) {
+        super(settings, clusterService, threadPool, 
+                transportService, new MockBenchmarkExecutor(client, clusterService));
     }
 
     public MockBenchmarkExecutor executor() {
@@ -60,94 +65,86 @@ public final class MockBenchmarkExecutorService extends BenchmarkExecutorService
      */
     static final class MockBenchmarkExecutor extends BenchmarkExecutor {
 
-        private Map<String, FlowControl> flows = new ConcurrentHashMap<>();
+        FlowControl control = null;
 
         public MockBenchmarkExecutor(final Client client, final ClusterService clusterService) {
             super(client, clusterService);
         }
 
-        public void addFlowControl(final String benchmarkId, final FlowControl flow) {
-            if (flows.containsKey(benchmarkId)) {
-                throw new ElasticsearchIllegalStateException("Already have flow control for benchmark: " + benchmarkId);
-            }
-            flows.put(benchmarkId, flow);
+        public void control(final FlowControl control) {
+            this.control = control;
+        }
+
+        public FlowControl control() {
+            return control;
+        }
+        
+        public void clear() {
+            control = null;
         }
 
         static final class FlowControl {
-            String        benchmarkId;
-            String        competitor;
-            int           current;
-            int           iteration;
-            Semaphore     control;
-            CyclicBarrier initialization;
 
-            FlowControl(final String benchmarkId, final String competitor, final int iteration, final Semaphore control, final CyclicBarrier initialization) {
-                this.benchmarkId    = benchmarkId;
-                this.competitor     = competitor;
-                this.iteration      = iteration;
-                this.control        = control;
-                this.initialization = initialization;
-            }
+            final CyclicBarrier initializationBarrier;
+            final Semaphore     controlSemaphore;
+            final String        competition;
 
-            void acquire() throws InterruptedException {
-                if (current == iteration) {
-                    logger.debug("benchmark [{}] blocking on acquire()", benchmarkId);
-                    control.acquire();
-                    logger.debug("benchmark [{}] released from acquire()", benchmarkId);
-                }
-            }
+            FlowControl(final CyclicBarrier initializationBarrier, final String competition, final Semaphore controlSemaphore) {
 
-            void release() {
-                control.release();
-            }
-
-            void clear() {
-                if (initialization != null) {
-                    initialization.reset();
-                    initialization = null;
-                }
-                if (control != null) {
-                    control.release();
-                    control = null;
-                }
+                this.initializationBarrier = initializationBarrier;
+                this.competition = competition;
+                this.controlSemaphore = controlSemaphore;
             }
         }
 
         public void clearMockState() {
-            for (Map.Entry<String, FlowControl> me : flows.entrySet()) {
-                if (me.getValue() != null) {
-                    me.getValue().clear();
+            if (control != null) {
+                control.initializationBarrier.reset();
+                control.controlSemaphore.release();
+                control = null;
+            }
+        }
+
+        @Override
+        public BenchmarkStatusNodeActionResponse start(BenchmarkStartRequest request)
+            throws ElasticsearchException {
+
+            if (control != null) {
+                try {
+                    control.initializationBarrier.await();
+                } catch (InterruptedException | BrokenBarrierException e) {
+                    logger.error("--> Failed to wait on initialization barrier: {}", 
+                            e, e.getMessage());
                 }
             }
-            flows.clear();
+
+            return super.start(request);
         }
 
         protected CompetitionIteration iterate(final String benchmarkId, final BenchmarkCompetitor competitor,
-                                               final List<SearchRequest> searchRequests,
-                                               final long[] timeBuckets, final long[] docBuckets,
-                                               final StoppableSemaphore semaphore) throws InterruptedException {
+                                               final List<SearchRequest> searchRequests, final long[] timeBuckets, final long[] docBuckets,
+                                               final StoppableSemaphore semaphore) 
+            throws InterruptedException {
 
-            final FlowControl flow = flows.get(benchmarkId);
+            CompetitionIteration ci = null;
 
-            if (flow != null) {
-                if (flow.current == 0 && flow.initialization != null) {
-                    try {
-                        flow.initialization.await();
-                        logger.debug("benchmark [{}] passed initialization barrier on node [{}]", benchmarkId, clusterService.localNode().name());
-                        flow.initialization = null;
-                    } catch (BrokenBarrierException e) {
-                        flow.clear();
-                        throw new RuntimeException("Failed to wait for shared initialization", e);
-                    }
+            try {
+                if (control != null && control.competition.equals(competitor.name())) {
+                    logger.info("--> Acquiring iteration semaphore: [{}] [{}]", 
+                            control.controlSemaphore, clusterService.localNode().name());
+                    control.controlSemaphore.acquire();
                 }
-
-                if (flow.benchmarkId.equals(benchmarkId) && flow.competitor.equals(competitor.name())) {
-                    flow.acquire();
-                    flow.current++;
+                ci = super.iterate(benchmarkId, competitor, searchRequests, timeBuckets, docBuckets, semaphore);
+            }
+            finally {
+                if (control != null && control.competition.equals(competitor.name())) {
+                    control.controlSemaphore.release();
+                    logger.info("--> Released iteration semaphore: [{}] [{}]", 
+                            control.controlSemaphore, clusterService.localNode().name());
                 }
             }
 
-            return super.iterate(benchmarkId, competitor, searchRequests, timeBuckets, docBuckets, semaphore);
+            return ci;
         }
     }
 }

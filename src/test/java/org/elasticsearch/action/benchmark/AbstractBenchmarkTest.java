@@ -116,36 +116,6 @@ public class AbstractBenchmarkTest extends ElasticsearchIntegrationTest {
         assertFalse(response.hasErrors());
     }
 
-    protected Tuple<CyclicBarrier, List<MockBenchmarkExecutorService.MockBenchmarkExecutor.FlowControl>> setUpFlowControl(
-            final BenchmarkStartRequest request,
-            final int competitorToPause,
-            final int iterationToPauseBefore) throws InterruptedException {
-
-        logger.info("--> Pausing competitor [{} (out of total competitors {})] before iteration [{} (out of total iterations {})]",
-                request.competitors().get(competitorToPause).name(), request.competitors().size(), iterationToPauseBefore,
-                request.competitors().get(competitorToPause).settings().iterations());
-
-        final List<MockBenchmarkExecutorService.MockBenchmarkExecutor.FlowControl> controls = new ArrayList<>();
-        final CyclicBarrier                           barrier  = new CyclicBarrier(request.numExecutorNodes() + 1);
-
-        for (BenchmarkExecutorService mock : mockExecutorServices()) {
-
-            final MockBenchmarkExecutorService.MockBenchmarkExecutor executor  = ((MockBenchmarkExecutorService) mock).executor();
-            final Semaphore semaphore = new Semaphore(1);
-
-            final MockBenchmarkExecutorService.MockBenchmarkExecutor.FlowControl control =
-                    new MockBenchmarkExecutorService.MockBenchmarkExecutor.FlowControl(request.benchmarkId(), request.competitors().get(competitorToPause).name(),
-                            iterationToPauseBefore,
-                            semaphore, barrier);
-
-            controls.add(control);
-            semaphore.acquire();
-            executor.addFlowControl(request.benchmarkId(), control);
-        }
-
-        return new Tuple<>(barrier, controls);
-    }
-
     protected void validateStatusAborted(final String benchmarkId, final BenchmarkAbortResponse response) {
 
         validateBatchedResponseHasNodeState(benchmarkId, response, BenchmarkMetaData.Entry.NodeState.ABORTED);
@@ -171,6 +141,19 @@ public class AbstractBenchmarkTest extends ElasticsearchIntegrationTest {
         assertThat(nodeResponses.size(), equalTo(numExecutorNodes));
         for (Map.Entry<String, BenchmarkMetaData.Entry.NodeState> entry : nodeResponses.entrySet()) {
             assertThat(entry.getValue(), equalTo(nodeState));
+        }
+    }
+
+    protected void control(final CyclicBarrier barrier, final String competition, List<Semaphore> semaphores) throws InterruptedException {
+
+        for (BenchmarkExecutorService mock : mockExecutorServices()) {
+
+            final MockBenchmarkExecutorService.MockBenchmarkExecutor executor = ((MockBenchmarkExecutorService) mock).executor();
+            final Semaphore semaphore = new Semaphore(1, true);
+            semaphore.acquire();
+            semaphores.add(semaphore);
+            MockBenchmarkExecutorService.MockBenchmarkExecutor.FlowControl control = new MockBenchmarkExecutorService.MockBenchmarkExecutor.FlowControl(barrier, competition, semaphore);
+            executor.control(control);
         }
     }
 }
