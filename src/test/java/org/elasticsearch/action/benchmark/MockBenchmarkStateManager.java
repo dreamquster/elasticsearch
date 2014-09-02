@@ -29,6 +29,9 @@ import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.transport.TransportService;
 
+import java.util.HashMap;
+import java.util.Map;
+
 /**
  * Mock state manager
  */
@@ -45,10 +48,10 @@ public class MockBenchmarkStateManager extends BenchmarkStateManager {
 
     @Override
     public void update(String benchmarkId, BenchmarkMetaData.State benchmarkState, BenchmarkMetaData.Entry.NodeState nodeState,
-                       final ActionListener listener) {
+                       final Map<String, BenchmarkCoordinatorService.Liveness> nodeLiveness, final ActionListener listener) {
 
         if (!forceFailureOnUpdate) {
-            super.update(benchmarkId, benchmarkState, nodeState, listener);
+            super.update(benchmarkId, benchmarkState, nodeState, nodeLiveness, listener);
             return;
         }
 

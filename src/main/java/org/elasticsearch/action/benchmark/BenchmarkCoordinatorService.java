@@ -31,6 +31,8 @@ import org.elasticsearch.action.benchmark.status.*;
 import org.elasticsearch.action.benchmark.exception.*;
 import org.elasticsearch.cluster.*;
 import org.elasticsearch.cluster.metadata.*;
+import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.cluster.node.DiscoveryNodes;
 import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.logging.ESLogger;
 import org.elasticsearch.common.logging.ESLoggerFactory;
@@ -43,7 +45,6 @@ import org.elasticsearch.transport.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
-
 
 /**
  * Coordinates execution of benchmarks.
@@ -109,7 +110,9 @@ public class BenchmarkCoordinatorService extends AbstractBenchmarkService<Benchm
     @Override
     public void clusterChanged(ClusterChangedEvent event) {
 
-        // NOCOMMIT - Need to detect dropped node here and remove from internal state where appropriate
+        if (isMasterNode() && event.nodesDelta().removed()) {
+            updateNodeLiveness(event.nodesDelta());
+        }
 
         final BenchmarkMetaData meta = event.state().metaData().custom(BenchmarkMetaData.TYPE);
         final BenchmarkMetaData prev = event.previousState().metaData().custom(BenchmarkMetaData.TYPE);
@@ -201,7 +204,7 @@ public class BenchmarkCoordinatorService extends AbstractBenchmarkService<Benchm
     /* ** Public API Methods ** */
 
     /**
-     * Starts a benchmark
+     * Starts a benchmark. Sets top-level and per-node state to INITIALIZING.
      * @param request   Benchmark request
      * @param listener  Response listener
      */
@@ -210,14 +213,14 @@ public class BenchmarkCoordinatorService extends AbstractBenchmarkService<Benchm
 
         preconditions(request.numExecutorNodes());
 
-        manager.start(request, new ActionListener() {
+        manager.start(request, new ActionListener<List<String>>() {
 
             @Override
-            public void onResponse(Object o) {
+            public void onResponse(List<String> nodeIds) {
 
                 assert null == benchmarks.get(request.benchmarkId());
 
-                final InternalCoordinatorState ics = new InternalCoordinatorState(request, listener);
+                final InternalCoordinatorState ics = new InternalCoordinatorState(request, nodeIds, listener);
 
                 ics.onReady    = new OnReadyStateChangeListener(ics);
                 ics.onFinished = new OnFinishedStateChangeListener(ics);
@@ -402,6 +405,7 @@ public class BenchmarkCoordinatorService extends AbstractBenchmarkService<Benchm
         public synchronized void onStateChange(final BenchmarkMetaData.Entry entry) {
 
             manager.update(entry.benchmarkId(), BenchmarkMetaData.State.RUNNING, BenchmarkMetaData.Entry.NodeState.RUNNING,
+                    ics.liveness,
                     new ActionListener() {
                         @Override
                         public void onResponse(Object o) { /* no-op */ }
@@ -439,6 +443,7 @@ public class BenchmarkCoordinatorService extends AbstractBenchmarkService<Benchm
             }
 
             manager.update(entry.benchmarkId(), BenchmarkMetaData.State.COMPLETED, BenchmarkMetaData.Entry.NodeState.COMPLETED,
+                    ics.liveness,
                     new ActionListener() {
                         @Override
                         public void onResponse(Object o) { /* no-op */ }
@@ -572,6 +577,7 @@ public class BenchmarkCoordinatorService extends AbstractBenchmarkService<Benchm
                 final InternalCoordinatorState ics = benchmarks.get(entry.benchmarkId());
 
                 manager.update(entry.benchmarkId(), BenchmarkMetaData.State.RUNNING, BenchmarkMetaData.Entry.NodeState.RUNNING,
+                        ics.liveness,
                         new ActionListener() {
                             @Override
                             public void onResponse(Object o) { /* no-op */ }
@@ -627,12 +633,30 @@ public class BenchmarkCoordinatorService extends AbstractBenchmarkService<Benchm
 
     /* ** Utilities ** */
 
+    protected static final class Liveness {
+
+        private final AtomicBoolean liveness;
+
+        Liveness() {
+            liveness = new AtomicBoolean(true);
+        }
+
+        public boolean alive() {
+            return liveness.get();
+        }
+
+        public boolean set(boolean expected, boolean updated) {
+            return liveness.compareAndSet(expected, updated);
+        }
+    }
+
     protected static final class InternalCoordinatorState {
 
         private static final ESLogger logger = ESLoggerFactory.getLogger(InternalCoordinatorState.class.getName());
 
         final String                benchmarkId;
         final BenchmarkStartRequest request;
+        final Map<String, Liveness> liveness;
         BenchmarkStartResponse      response;
 
         AtomicBoolean running  = new AtomicBoolean(false);
@@ -650,10 +674,21 @@ public class BenchmarkCoordinatorService extends AbstractBenchmarkService<Benchm
         OnAbortStateChangeListener    onAbort;
         OnFailedStateChangeListener   onFailed;
 
-        InternalCoordinatorState(final BenchmarkStartRequest request, final ActionListener<BenchmarkStartResponse> listener) {
+        InternalCoordinatorState(final BenchmarkStartRequest request, final List<String> nodeIds,
+                                 final ActionListener<BenchmarkStartResponse> listener) {
             this.benchmarkId = request.benchmarkId();
             this.request     = request;
             this.listener    = listener;
+
+            final Map<String, Liveness> map = new HashMap<>();
+            for (final String nodeId : nodeIds) {
+                map.put(nodeId, new Liveness());
+            }
+            liveness = Collections.unmodifiableMap(map);
+        }
+
+        boolean isNodeAlive(final String nodeId) {
+            return liveness.containsKey(nodeId) && liveness.get(nodeId).alive();
         }
 
         boolean canStartRunning() {
@@ -709,6 +744,22 @@ public class BenchmarkCoordinatorService extends AbstractBenchmarkService<Benchm
         }
     }
 
+    private void updateNodeLiveness(final DiscoveryNodes.Delta delta) {
+
+        for (final DiscoveryNode node : delta.removedNodes()) {
+            for (Map.Entry<String, InternalCoordinatorState> entry : benchmarks.entrySet()) {
+                if (entry.getValue().isNodeAlive(node.id())) {
+                    final Liveness liveness = entry.getValue().liveness.get(node.id());
+                    if (liveness != null) {
+                        if (liveness.set(true, false)) {
+                            logger.warn("benchmark [{}]: marked node [{}] as not live", entry.getKey(), node.id());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     protected void preconditions(int num) {
         final int n = BenchmarkUtility.executors(clusterService.state().nodes(), num).size();
         if (n < num) {
@@ -739,6 +790,13 @@ public class BenchmarkCoordinatorService extends AbstractBenchmarkService<Benchm
 
     private boolean checkAllNodeStates(final BenchmarkMetaData.Entry entry, final BenchmarkMetaData.Entry.NodeState state) {
         for (Map.Entry<String, BenchmarkMetaData.Entry.NodeState> e : entry.nodeStateMap().entrySet()) {
+            if (e.getValue() == BenchmarkMetaData.Entry.NodeState.FAILED) {
+                continue;   // Failed nodes don't factor in
+            }
+            final InternalCoordinatorState ics = benchmarks.get(entry.benchmarkId());
+            if (ics != null && !ics.isNodeAlive(e.getKey())) {
+                continue;   // Dead nodes don't factor in
+            }
             if (e.getValue() != state) {
                 return false;
             }
@@ -748,6 +806,12 @@ public class BenchmarkCoordinatorService extends AbstractBenchmarkService<Benchm
 
     private boolean allNodesFinished(final BenchmarkMetaData.Entry entry) {
         for (Map.Entry<String, BenchmarkMetaData.Entry.NodeState> e : entry.nodeStateMap().entrySet()) {
+
+            final InternalCoordinatorState ics = benchmarks.get(entry.benchmarkId());
+            if (ics != null && !ics.isNodeAlive(e.getKey())) {
+                continue;   // Dead nodes don't factor in
+            }
+
             if (e.getValue() == BenchmarkMetaData.Entry.NodeState.INITIALIZING ||
                 e.getValue() == BenchmarkMetaData.Entry.NodeState.READY ||
                 e.getValue() == BenchmarkMetaData.Entry.NodeState.RUNNING ||
@@ -765,7 +829,7 @@ public class BenchmarkCoordinatorService extends AbstractBenchmarkService<Benchm
             sb.append(" ").append(e.getKey()).append(":").append(e.getValue());
         }
         sb.append(" ]");
-        logger.debug(sb.toString());
+        logger.info(sb.toString());
     }
 
     /* ** Request Handlers ** */

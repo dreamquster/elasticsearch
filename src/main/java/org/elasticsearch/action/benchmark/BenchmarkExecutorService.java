@@ -100,7 +100,7 @@ public class BenchmarkExecutorService extends AbstractBenchmarkService<Benchmark
                     // Fetch benchmark definition from master
                     logger.debug("benchmark [{}]: fetching definition", entry.benchmarkId());
                     final BenchmarkDefinitionResponseHandler handler = new BenchmarkDefinitionResponseHandler(entry.benchmarkId());
-                    
+
                     threadPool.executor(ThreadPool.Names.GENERIC).execute(new Runnable() {
                         @Override
                         public void run() {
@@ -113,7 +113,7 @@ public class BenchmarkExecutorService extends AbstractBenchmarkService<Benchmark
                     });
                     break;
                 case RUNNING:
-                    if (entry.nodeStateMap().get(nodeId()) != BenchmarkMetaData.Entry.NodeState.RUNNING) {
+                    if (ies == null || entry.nodeStateMap().get(nodeId()) != BenchmarkMetaData.Entry.NodeState.RUNNING) {
                         break;
                     }
 
@@ -151,7 +151,7 @@ public class BenchmarkExecutorService extends AbstractBenchmarkService<Benchmark
                     }
                     break;
                 case RESUMING:
-                    if (entry.nodeStateMap().get(nodeId()) != BenchmarkMetaData.Entry.NodeState.PAUSED) {
+                    if (ies == null || entry.nodeStateMap().get(nodeId()) != BenchmarkMetaData.Entry.NodeState.PAUSED) {
                         break;
                     }
 
@@ -167,8 +167,8 @@ public class BenchmarkExecutorService extends AbstractBenchmarkService<Benchmark
                     }
                     break;
                 case PAUSED:
-                    if (entry.nodeStateMap().get(nodeId()) != BenchmarkMetaData.Entry.NodeState.RUNNING &&
-                        entry.nodeStateMap().get(nodeId()) != BenchmarkMetaData.Entry.NodeState.READY) {
+                    if (ies == null || (entry.nodeStateMap().get(nodeId()) != BenchmarkMetaData.Entry.NodeState.RUNNING &&
+                                        entry.nodeStateMap().get(nodeId()) != BenchmarkMetaData.Entry.NodeState.READY)) {
                         break;
                     }
 
@@ -183,9 +183,9 @@ public class BenchmarkExecutorService extends AbstractBenchmarkService<Benchmark
                     }
                     break;
                 case ABORTED:
-                    if (entry.nodeStateMap().get(nodeId()) == BenchmarkMetaData.Entry.NodeState.COMPLETED &&
-                        entry.nodeStateMap().get(nodeId()) == BenchmarkMetaData.Entry.NodeState.ABORTED &&
-                        entry.nodeStateMap().get(nodeId()) == BenchmarkMetaData.Entry.NodeState.FAILED) {
+                    if (ies == null || (entry.nodeStateMap().get(nodeId()) == BenchmarkMetaData.Entry.NodeState.COMPLETED &&
+                                        entry.nodeStateMap().get(nodeId()) == BenchmarkMetaData.Entry.NodeState.ABORTED &&
+                                        entry.nodeStateMap().get(nodeId()) == BenchmarkMetaData.Entry.NodeState.FAILED)) {
                         break;
                     }
 
@@ -246,10 +246,10 @@ public class BenchmarkExecutorService extends AbstractBenchmarkService<Benchmark
             try {
                 // Initialize the benchmark state inside the executor
                 executor.create(response.benchmarkStartRequest);
-
             } catch (Throwable t) {
                 logger.error("benchmark [{}]: failed to create", t, response.benchmarkId);
                 benchmarks.remove(benchmarkId);
+                executor.clear(benchmarkId);
                 newNodeState = BenchmarkMetaData.Entry.NodeState.FAILED;
             }
 
@@ -264,6 +264,7 @@ public class BenchmarkExecutorService extends AbstractBenchmarkService<Benchmark
         public void handleException(TransportException e) {
             logger.error("benchmark [{}]: failed to receive definition - cannot execute", e, benchmarkId);
             benchmarks.remove(benchmarkId);
+            executor.clear(benchmarkId);
         }
 
         @Override
@@ -295,6 +296,7 @@ public class BenchmarkExecutorService extends AbstractBenchmarkService<Benchmark
         public void handleException(TransportException e) {
             logger.error("benchmark [{}]: failed to receive state change acknowledgement - cannot execute", e, benchmarkId);
             benchmarks.remove(benchmarkId);
+            executor.clear(benchmarkId);
         }
 
         @Override

@@ -19,8 +19,7 @@
 
 package org.elasticsearch.action.benchmark;
 
-import org.elasticsearch.cluster.ClusterChangedEvent;
-import org.elasticsearch.cluster.ClusterService;
+import org.elasticsearch.cluster.*;
 import org.elasticsearch.cluster.metadata.BenchmarkMetaData;
 import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.settings.Settings;
@@ -64,7 +63,7 @@ public class MockBenchmarkCoordinatorService extends BenchmarkCoordinatorService
         final BenchmarkMetaData meta = event.state().metaData().custom(BenchmarkMetaData.TYPE);
         final BenchmarkMetaData prev = event.previousState().metaData().custom(BenchmarkMetaData.TYPE);
 
-        logger.debug("--> Observing event: [{}]", event.source());
+        logger.info("--> Observing event: [{}]", event.source());
 
         for (final BenchmarkMetaData.Entry entry : BenchmarkMetaData.delta(prev, meta)) {
 

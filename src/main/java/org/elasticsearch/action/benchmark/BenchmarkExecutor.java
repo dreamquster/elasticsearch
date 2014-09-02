@@ -133,7 +133,9 @@ public class BenchmarkExecutor {
 
     public void clear(String benchmarkId) {
         synchronized (lock) {
-            active = ImmutableOpenMap.builder(active).fRemove(benchmarkId).build();
+            if (active.containsKey(benchmarkId)) {
+                active = ImmutableOpenMap.builder(active).fRemove(benchmarkId).build();
+            }
         }
     }
 

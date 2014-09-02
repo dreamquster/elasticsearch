@@ -32,11 +32,13 @@ import org.elasticsearch.action.benchmark.start.BenchmarkStartResponse;
 import org.elasticsearch.action.benchmark.status.BenchmarkStatusResponseHandler;
 import org.elasticsearch.action.benchmark.status.BenchmarkStatusResponseListener;
 import org.elasticsearch.action.benchmark.status.BenchmarkStatusTransportRequest;
+import org.elasticsearch.action.benchmark.BenchmarkCoordinatorService.Liveness;
 import org.elasticsearch.action.support.master.MasterNodeOperationRequest;
 import org.elasticsearch.cluster.ClusterService;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.TimeoutClusterStateUpdateTask;
 import org.elasticsearch.cluster.metadata.BenchmarkMetaData;
+import org.elasticsearch.cluster.metadata.BenchmarkMetaData.Entry;
 import org.elasticsearch.cluster.metadata.MetaData;
 import org.elasticsearch.cluster.node.DiscoveryNode;
 import org.elasticsearch.common.inject.Inject;
@@ -67,6 +69,9 @@ public class BenchmarkStateManager {
     private static final EnumSet<BenchmarkMetaData.State> ABORT_ELIGIBLE = EnumSet.of(BenchmarkMetaData.State.RUNNING,
             BenchmarkMetaData.State.PAUSED, BenchmarkMetaData.State.RESUMING);
 
+    // Consider node states COMPLETED, ABORTED, or FAILED to be final and not subject to updates
+    private static final EnumSet<Entry.NodeState> UPDATE_ELIGIBLE = EnumSet.complementOf(EnumSet.of(Entry.NodeState.COMPLETED,
+            Entry.NodeState.ABORTED, Entry.NodeState.FAILED));
 
     @Inject
     public BenchmarkStateManager(final ClusterService clusterService, final ThreadPool threadPool, final TransportService transportService) {
@@ -81,7 +86,7 @@ public class BenchmarkStateManager {
      * @param request   Benchmark request and definition
      * @param listener  Response listener
      */
-    public void start(final BenchmarkStartRequest request, final ActionListener listener) {
+    public void start(final BenchmarkStartRequest request, final ActionListener<List<String>> listener) {
 
         final String cause = "benchmark-start-request (" + request.benchmarkId() + ")";
 
@@ -112,8 +117,10 @@ public class BenchmarkStateManager {
 
                 // Assign nodes on which to execute the benchmark
                 final BenchmarkMetaData.Entry entry = new BenchmarkMetaData.Entry(request.benchmarkId());
+                final List<String> nodeIds = new ArrayList<String>();
                 final List<DiscoveryNode> nodes = BenchmarkUtility.executors(clusterService.state().nodes(), request.numExecutorNodes());
                 for (DiscoveryNode node : nodes) {
+                    nodeIds.add(node.id());
                     entry.nodeStateMap().put(node.id(), BenchmarkMetaData.Entry.NodeState.INITIALIZING);
                 }
 
@@ -122,8 +129,8 @@ public class BenchmarkStateManager {
                 final MetaData.Builder metabuilder = MetaData.builder(state.metaData());
                 metabuilder.putCustom(BenchmarkMetaData.TYPE, new BenchmarkMetaData(builder.build()));
 
-                // Notify caller that everything is OK
-                listener.onResponse(null);
+                // Notify caller that everything is OK and send back a list of nodeIds on which the benchmark will execute
+                listener.onResponse(nodeIds);
 
                 return ClusterState.builder(state).metaData(metabuilder).build();
             }
@@ -253,10 +260,12 @@ public class BenchmarkStateManager {
      * @param benchmarkId       Benchmark to update
      * @param benchmarkState    New state to apply
      * @param nodeState         New per-node state to apply
+     * @param nodeLiveness      Per-node liveness state
      * @param listener          Response listener
      */
     public void update(final String benchmarkId, final BenchmarkMetaData.State benchmarkState,
-                       final BenchmarkMetaData.Entry.NodeState nodeState, final ActionListener listener) {
+                       final BenchmarkMetaData.Entry.NodeState nodeState,
+                       final Map<String, Liveness> nodeLiveness, final ActionListener listener) {
 
         final String cause = "benchmark-update-state (" + benchmarkId + ":" + benchmarkState + ")";
 
@@ -281,7 +290,15 @@ public class BenchmarkStateManager {
                         if (nodeState != null) {
                             map = new HashMap<>();
                             for (Map.Entry<String, BenchmarkMetaData.Entry.NodeState> e : entry.nodeStateMap().entrySet()) {
-                                map.put(e.getKey(), nodeState);
+                                final Liveness liveness = nodeLiveness.get(e.getKey());
+                                if (liveness != null && !liveness.alive()) {
+                                    logger.warn("benchmark [{}]: marking dead node [{}] as {}", entry.benchmarkId(), e.getKey(), Entry.NodeState.FAILED);
+                                    map.put(e.getKey(), Entry.NodeState.FAILED);
+                                } else if (UPDATE_ELIGIBLE.contains(e.getValue())) {
+                                    map.put(e.getKey(), nodeState);
+                                } else {
+                                    map.put(e.getKey(), e.getValue());
+                                }
                             }
                         }
                         builder.add(new BenchmarkMetaData.Entry(entry.benchmarkId(), benchmarkState, map));
